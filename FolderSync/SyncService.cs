@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Threading.Tasks;
 using FolderSync.Utilities;
 
 namespace FolderSync
@@ -23,7 +24,18 @@ namespace FolderSync
         }
 
         /// <summary>
-        /// Perform one-time synchronization from source to replica
+        /// Perform asynchronous synchronization from source to replica with deletion support
+        /// </summary>
+        /// <param name="sourcePath">Source directory path</param>
+        /// <param name="replicaPath">Replica directory path</param>
+        /// <returns>Statistics about the synchronization operation</returns>
+        public async Task<SyncStats> SynchronizeAsync(string sourcePath, string replicaPath)
+        {
+            return await Task.Run(() => SynchronizeOnce(sourcePath, replicaPath));
+        }
+
+        /// <summary>
+        /// Perform one-time synchronization from source to replica with deletion support
         /// </summary>
         /// <param name="sourcePath">Source directory path</param>
         /// <param name="replicaPath">Replica directory path</param>
@@ -50,6 +62,9 @@ namespace FolderSync
 
                 // Perform iterative synchronization to avoid recursion
                 SynchronizeDirectoryIterative(sourcePath, replicaPath, stats);
+
+                // Remove files/directories from replica that no longer exist in source
+                RemoveDeletedItems(sourcePath, replicaPath, stats);
 
                 _logger.LogInfo($"Synchronization completed successfully");
             }
@@ -129,9 +144,10 @@ namespace FolderSync
 
                     if (ShouldCopyFile(sourceFile, replicaFile))
                     {
+                        bool fileExisted = File.Exists(replicaFile);
                         File.Copy(sourceFile, replicaFile, true);
                         
-                        if (File.Exists(replicaFile))
+                        if (fileExisted)
                         {
                             _logger.LogInfo($"Updated file: {replicaFile}");
                             stats.FilesUpdated++;
@@ -178,6 +194,142 @@ namespace FolderSync
             {
                 _logger.LogWarning($"Error comparing files {sourceFile} and {replicaFile}: {ex.Message}");
                 return true; // Default to copying on error
+            }
+        }
+
+        /// <summary>
+        /// Remove files and directories from replica that no longer exist in source
+        /// </summary>
+        /// <param name="sourcePath">Source directory path</param>
+        /// <param name="replicaPath">Replica directory path</param>
+        /// <param name="stats">Statistics to update</param>
+        private void RemoveDeletedItems(string sourcePath, string replicaPath, SyncStats stats)
+        {
+            try
+            {
+                // Remove files that don't exist in source
+                RemoveDeletedFiles(sourcePath, replicaPath, stats);
+
+                // Remove directories that don't exist in source
+                RemoveDeletedDirectories(sourcePath, replicaPath, stats);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError($"Error removing deleted items: {ex.Message}");
+                stats.ErrorsEncountered++;
+            }
+        }
+
+        /// <summary>
+        /// Remove files from replica that don't exist in source
+        /// </summary>
+        private void RemoveDeletedFiles(string sourcePath, string replicaPath, SyncStats stats)
+        {
+            // Use stack for iterative traversal
+            var directoriesToCheck = new Stack<(string source, string replica)>();
+            directoriesToCheck.Push((sourcePath, replicaPath));
+
+            while (directoriesToCheck.Count > 0)
+            {
+                var (currentSource, currentReplica) = directoriesToCheck.Pop();
+
+                try
+                {
+                    if (!Directory.Exists(currentReplica))
+                        continue;
+
+                    // Check files in current replica directory
+                    var replicaFiles = Directory.EnumerateFiles(currentReplica);
+                    foreach (var replicaFile in replicaFiles)
+                    {
+                        var fileName = Path.GetFileName(replicaFile);
+                        var sourceFile = Path.Combine(currentSource, fileName);
+
+                        if (!File.Exists(sourceFile))
+                        {
+                            try
+                            {
+                                File.Delete(replicaFile);
+                                _logger.LogInfo($"Deleted file: {replicaFile}");
+                                stats.FilesDeleted++;
+                            }
+                            catch (Exception ex)
+                            {
+                                _logger.LogError($"Error deleting file {replicaFile}: {ex.Message}");
+                                stats.ErrorsEncountered++;
+                            }
+                        }
+                    }
+
+                    // Add subdirectories to check
+                    if (Directory.Exists(currentSource))
+                    {
+                        var replicaSubDirs = Directory.EnumerateDirectories(currentReplica);
+                        foreach (var replicaSubDir in replicaSubDirs)
+                        {
+                            var dirName = Path.GetFileName(replicaSubDir);
+                            var sourceSubDir = Path.Combine(currentSource, dirName);
+                            directoriesToCheck.Push((sourceSubDir, replicaSubDir));
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError($"Error checking files in {currentReplica}: {ex.Message}");
+                    stats.ErrorsEncountered++;
+                }
+            }
+        }
+
+        /// <summary>
+        /// Remove directories from replica that don't exist in source
+        /// </summary>
+        private void RemoveDeletedDirectories(string sourcePath, string replicaPath, SyncStats stats)
+        {
+            try
+            {
+                if (!Directory.Exists(replicaPath))
+                    return;
+
+                var replicaDirectories = Directory.EnumerateDirectories(replicaPath);
+                var directoriesToDelete = new List<string>();
+
+                foreach (var replicaDir in replicaDirectories)
+                {
+                    var dirName = Path.GetFileName(replicaDir);
+                    var sourceDir = Path.Combine(sourcePath, dirName);
+
+                    if (!Directory.Exists(sourceDir))
+                    {
+                        directoriesToDelete.Add(replicaDir);
+                    }
+                    else
+                    {
+                        // Recursively check subdirectories
+                        RemoveDeletedDirectories(sourceDir, replicaDir, stats);
+                    }
+                }
+
+                // Delete directories that don't exist in source
+                foreach (var dirToDelete in directoriesToDelete)
+                {
+                    try
+                    {
+                        Directory.Delete(dirToDelete, true);
+                        _logger.LogInfo($"Deleted directory: {dirToDelete}");
+                        stats.DirectoriesDeleted++;
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError($"Error deleting directory {dirToDelete}: {ex.Message}");
+                        stats.ErrorsEncountered++;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError($"Error checking directories in {replicaPath}: {ex.Message}");
+                stats.ErrorsEncountered++;
             }
         }
     }
