@@ -19,7 +19,6 @@ namespace FolderSync
         {
             _logFilePath = logFilePath;
             
-            // Ensure log directory exists
             var logDir = Path.GetDirectoryName(Path.GetFullPath(logFilePath));
             if (!string.IsNullOrEmpty(logDir) && !Directory.Exists(logDir))
             {
@@ -66,10 +65,8 @@ namespace FolderSync
 
             lock (_lockObject)
             {
-                // Write to console
                 Console.WriteLine(logEntry);
 
-                // Write to file
                 try
                 {
                     File.AppendAllText(_logFilePath, logEntry + Environment.NewLine);

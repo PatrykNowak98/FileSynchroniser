@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Security.Cryptography;
 using System.Threading.Tasks;
 using FolderSync.Utilities;
 
@@ -28,10 +29,11 @@ namespace FolderSync
         /// </summary>
         /// <param name="sourcePath">Source directory path</param>
         /// <param name="replicaPath">Replica directory path</param>
+        /// <param name="useMd5Verification">Whether to use MD5 for file comparison</param>
         /// <returns>Statistics about the synchronization operation</returns>
-        public async Task<SyncStats> SynchronizeAsync(string sourcePath, string replicaPath)
+        public async Task<SyncStats> SynchronizeAsync(string sourcePath, string replicaPath, bool useMd5Verification = false)
         {
-            return await Task.Run(() => SynchronizeOnce(sourcePath, replicaPath));
+            return await Task.Run(() => SynchronizeOnce(sourcePath, replicaPath, useMd5Verification));
         }
 
         /// <summary>
@@ -39,20 +41,19 @@ namespace FolderSync
         /// </summary>
         /// <param name="sourcePath">Source directory path</param>
         /// <param name="replicaPath">Replica directory path</param>
+        /// <param name="useMd5Verification">Whether to use MD5 for file comparison</param>
         /// <returns>Statistics about the synchronization operation</returns>
-        public SyncStats SynchronizeOnce(string sourcePath, string replicaPath)
+        public SyncStats SynchronizeOnce(string sourcePath, string replicaPath, bool useMd5Verification = false)
         {
             var stats = new SyncStats();
 
             try
             {
-                // Validate paths
                 if (!PathHelper.IsValidPath(sourcePath))
                 {
                     throw new DirectoryNotFoundException($"Source directory not found: {sourcePath}");
                 }
 
-                // Ensure replica directory exists
                 if (!Directory.Exists(replicaPath))
                 {
                     Directory.CreateDirectory(replicaPath);
@@ -60,10 +61,7 @@ namespace FolderSync
                     stats.DirectoriesCreated++;
                 }
 
-                // Perform iterative synchronization to avoid recursion
-                SynchronizeDirectoryIterative(sourcePath, replicaPath, stats);
-
-                // Remove files/directories from replica that no longer exist in source
+                SynchronizeDirectoryIterative(sourcePath, replicaPath, stats, useMd5Verification);
                 RemoveDeletedItems(sourcePath, replicaPath, stats);
 
                 _logger.LogInfo($"Synchronization completed successfully");
@@ -83,9 +81,9 @@ namespace FolderSync
         /// <param name="sourcePath">Source directory path</param>
         /// <param name="replicaPath">Replica directory path</param>
         /// <param name="stats">Statistics to update</param>
-        private void SynchronizeDirectoryIterative(string sourcePath, string replicaPath, SyncStats stats)
+        /// <param name="useMd5Verification">Whether to use MD5 for file comparison</param>
+        private void SynchronizeDirectoryIterative(string sourcePath, string replicaPath, SyncStats stats, bool useMd5Verification)
         {
-            // Use stack for iterative directory traversal
             var directoriesToProcess = new Stack<(string source, string replica)>();
             directoriesToProcess.Push((sourcePath, replicaPath));
 
@@ -95,17 +93,14 @@ namespace FolderSync
 
                 try
                 {
-                    // Process files in current directory
-                    ProcessFilesInDirectory(currentSource, currentReplica, stats);
+                    ProcessFilesInDirectory(currentSource, currentReplica, stats, useMd5Verification);
 
-                    // Process subdirectories
                     var sourceDirectories = Directory.EnumerateDirectories(currentSource);
                     foreach (var sourceSubDir in sourceDirectories)
                     {
                         var dirName = Path.GetFileName(sourceSubDir);
                         var replicaSubDir = Path.Combine(currentReplica, dirName);
 
-                        // Create replica subdirectory if it doesn't exist
                         if (!Directory.Exists(replicaSubDir))
                         {
                             Directory.CreateDirectory(replicaSubDir);
@@ -113,7 +108,6 @@ namespace FolderSync
                             stats.DirectoriesCreated++;
                         }
 
-                        // Add to stack for processing
                         directoriesToProcess.Push((sourceSubDir, replicaSubDir));
                     }
                 }
@@ -131,7 +125,8 @@ namespace FolderSync
         /// <param name="sourceDir">Source directory</param>
         /// <param name="replicaDir">Replica directory</param>
         /// <param name="stats">Statistics to update</param>
-        private void ProcessFilesInDirectory(string sourceDir, string replicaDir, SyncStats stats)
+        /// <param name="useMd5Verification">Whether to use MD5 for file comparison</param>
+        private void ProcessFilesInDirectory(string sourceDir, string replicaDir, SyncStats stats, bool useMd5Verification)
         {
             var sourceFiles = Directory.EnumerateFiles(sourceDir);
             
@@ -142,9 +137,15 @@ namespace FolderSync
                     var fileName = Path.GetFileName(sourceFile);
                     var replicaFile = Path.Combine(replicaDir, fileName);
 
-                    if (ShouldCopyFile(sourceFile, replicaFile))
+                    if (ShouldCopyFile(sourceFile, replicaFile, useMd5Verification))
                     {
                         bool fileExisted = File.Exists(replicaFile);
+                        
+                        if (fileExisted && File.GetAttributes(replicaFile).HasFlag(FileAttributes.ReadOnly))
+                        {
+                            File.SetAttributes(replicaFile, FileAttributes.Normal);
+                        }
+                        
                         File.Copy(sourceFile, replicaFile, true);
                         
                         if (fileExisted)
@@ -168,16 +169,16 @@ namespace FolderSync
         }
 
         /// <summary>
-        /// Determine if a file should be copied based on existence, size, and timestamp
+        /// Determine if a file should be copied based on existence, size, timestamp, and optionally MD5
         /// </summary>
         /// <param name="sourceFile">Source file path</param>
         /// <param name="replicaFile">Replica file path</param>
+        /// <param name="useMd5Verification">Whether to use MD5 for comparison</param>
         /// <returns>True if file should be copied</returns>
-        private bool ShouldCopyFile(string sourceFile, string replicaFile)
+        private bool ShouldCopyFile(string sourceFile, string replicaFile, bool useMd5Verification)
         {
             try
             {
-                // If replica file doesn't exist, copy it
                 if (!File.Exists(replicaFile))
                 {
                     return true;
@@ -186,14 +187,20 @@ namespace FolderSync
                 var sourceInfo = new FileInfo(sourceFile);
                 var replicaInfo = new FileInfo(replicaFile);
 
-                // Compare file size and last write time
-                return sourceInfo.Length != replicaInfo.Length ||
-                       sourceInfo.LastWriteTime != replicaInfo.LastWriteTime;
+                bool sizeOrTimeChanged = sourceInfo.Length != replicaInfo.Length ||
+                                       sourceInfo.LastWriteTime != replicaInfo.LastWriteTime;
+
+                if (useMd5Verification && !sizeOrTimeChanged)
+                {
+                    return !FilesHaveSameMd5Hash(sourceFile, replicaFile);
+                }
+
+                return sizeOrTimeChanged;
             }
             catch (Exception ex)
             {
                 _logger.LogWarning($"Error comparing files {sourceFile} and {replicaFile}: {ex.Message}");
-                return true; // Default to copying on error
+                return true;
             }
         }
 
@@ -207,10 +214,7 @@ namespace FolderSync
         {
             try
             {
-                // Remove files that don't exist in source
                 RemoveDeletedFiles(sourcePath, replicaPath, stats);
-
-                // Remove directories that don't exist in source
                 RemoveDeletedDirectories(sourcePath, replicaPath, stats);
             }
             catch (Exception ex)
@@ -225,7 +229,6 @@ namespace FolderSync
         /// </summary>
         private void RemoveDeletedFiles(string sourcePath, string replicaPath, SyncStats stats)
         {
-            // Use stack for iterative traversal
             var directoriesToCheck = new Stack<(string source, string replica)>();
             directoriesToCheck.Push((sourcePath, replicaPath));
 
@@ -238,7 +241,6 @@ namespace FolderSync
                     if (!Directory.Exists(currentReplica))
                         continue;
 
-                    // Check files in current replica directory
                     var replicaFiles = Directory.EnumerateFiles(currentReplica);
                     foreach (var replicaFile in replicaFiles)
                     {
@@ -261,7 +263,6 @@ namespace FolderSync
                         }
                     }
 
-                    // Add subdirectories to check
                     if (Directory.Exists(currentSource))
                     {
                         var replicaSubDirs = Directory.EnumerateDirectories(currentReplica);
@@ -305,12 +306,10 @@ namespace FolderSync
                     }
                     else
                     {
-                        // Recursively check subdirectories
                         RemoveDeletedDirectories(sourceDir, replicaDir, stats);
                     }
                 }
 
-                // Delete directories that don't exist in source
                 foreach (var dirToDelete in directoriesToDelete)
                 {
                     try
@@ -330,6 +329,39 @@ namespace FolderSync
             {
                 _logger.LogError($"Error checking directories in {replicaPath}: {ex.Message}");
                 stats.ErrorsEncountered++;
+            }
+        }
+
+        /// <summary>
+        /// Compare two files using MD5 hash
+        /// </summary>
+        /// <param name="file1Path">Path to first file</param>
+        /// <param name="file2Path">Path to second file</param>
+        /// <returns>True if files have the same MD5 hash</returns>
+        private bool FilesHaveSameMd5Hash(string file1Path, string file2Path)
+        {
+            try
+            {
+                using var md5 = MD5.Create();
+                
+                byte[] hash1, hash2;
+                
+                using (var stream1 = File.OpenRead(file1Path))
+                {
+                    hash1 = md5.ComputeHash(stream1);
+                }
+                
+                using (var stream2 = File.OpenRead(file2Path))
+                {
+                    hash2 = md5.ComputeHash(stream2);
+                }
+
+                return hash1.SequenceEqual(hash2);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning($"Error computing MD5 hash for {file1Path} and {file2Path}: {ex.Message}");
+                return false;
             }
         }
     }
